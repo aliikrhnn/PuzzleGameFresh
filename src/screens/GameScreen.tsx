@@ -79,13 +79,13 @@ export function GameScreen({ navigation }: Props) {
   const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
 
   // ── Grid ölçümü ─────────────────────────────────────────────────────────────
-  const measureGrid = useCallback(() => {
-    setTimeout(() => {
-      gridContainerRef.current?.measureInWindow((x, y, w, h) => {
-        gridMeasures.current = { x, y, width: w, height: h };
-      });
-    }, 150);
-  }, []);
+const measureGrid = useCallback(() => {
+  requestAnimationFrame(() => {
+    gridContainerRef.current?.measureInWindow((x, y, w, h) => {
+      gridMeasures.current = { x, y, width: w, height: h };
+    });
+  });
+}, []);
 
   // ── PanResponder fabrikası (slot başına bir tane, bir kez oluşturulur) ──────
   const panResponders = useRef(
@@ -117,17 +117,25 @@ export function GameScreen({ navigation }: Props) {
           const pCols = piece.shape[0].length;
           const pRows = piece.shape.length;
           // boardWrap borderWidth (1px) hücre başlangıcını kaydırır
-          const relX = gestureState.moveX - grid.x - 1;
-          const relY = gestureState.moveY - grid.y - 1;
+         const relX = gestureState.moveX - grid.x;
+const relY = gestureState.moveY - grid.y;
 
-          // Parçanın görsel merkezini parmağa hizala.
-          // Gerçek görsel genişlik = pCols*step - GAP (son sütunun sağında gap yok)
-          const rawCol = Math.floor((relX - (pCols * s - GAP) / 2) / s);
-          const rawRow = Math.floor((relY - (pRows * s - GAP) / 2) / s);
+const pieceWidth = pCols * s - GAP;
+const pieceHeight = pRows * s - GAP;
 
-          const inGrid =
-            relX > -pCols * s && relX < grid.width + pCols * s &&
-            relY > -pRows * s && relY < grid.height + pRows * s;
+// Parmağı parçanın merkezine değil, biraz üst-orta hissine bağlamak daha doğal.
+// Böylece kullanıcı nereye bırakıyorsa oraya daha net oturur.
+const anchorX = pieceWidth / 2;
+const anchorY = pieceHeight / 2;
+
+const rawCol = Math.round((relX - anchorX) / s);
+const rawRow = Math.round((relY - anchorY) / s);
+
+         const inGrid =
+  relX >= -pieceWidth &&
+  relX <= grid.width + pieceWidth &&
+  relY >= -pieceHeight &&
+  relY <= grid.height + pieceHeight;
 
           if (!inGrid) {
             if (previewPosRef.current) { previewPosRef.current = null; setPreviewPos(null); }
@@ -346,11 +354,7 @@ export function GameScreen({ navigation }: Props) {
         {!isGameOver && (
           <View style={styles.tray}>
 
-            {/* Döndür (seçili parçayı) */}
-            <TouchableOpacity style={styles.trayBtn} onPress={() => GameManager.rotateCurrent()}>
-              <Text style={styles.trayBtnText}>↻</Text>
-            </TouchableOpacity>
-
+          
             {/* 3 sürüklenebilir parça */}
             <View style={styles.trayPieces}>
               {gs.piecePool.map((piece, slotIndex) => {
@@ -365,18 +369,20 @@ export function GameScreen({ navigation }: Props) {
                   <Animated.View
                     key={piece.id}
                     {...panResponders[slotIndex].panHandlers}
-                    style={[
-                      styles.traySlot,
-                      isSelected && !isDraggingThis && styles.traySlotSelected,
-                      {
-                        width: pW,
-                        height: pH,
-                        opacity: activeDragIndex !== null && !isDraggingThis ? 0.45 : 1,
-                        transform: isDraggingThis
-                          ? [{ translateX: pan.x }, { translateY: pan.y }]
-                          : [],
-                      },
-                    ]}
+                  style={[
+  styles.traySlot,
+  isSelected && !isDraggingThis && styles.traySlotSelected,
+  {
+    width: pW,
+    height: pH,
+    opacity: activeDragIndex !== null && !isDraggingThis ? 0.35 : 1,
+    zIndex: isDraggingThis ? 999 : 1,
+    elevation: isDraggingThis ? 999 : 1,
+    transform: isDraggingThis
+      ? [{ translateX: pan.x }, { translateY: pan.y }, { scale: 1.04 }]
+      : [{ scale: 1 }],
+  },
+]}
                   >
                     {piece.shape.map((row, r) =>
                       row.map((cell, c) => {
@@ -563,24 +569,29 @@ const styles = StyleSheet.create({
   btnGhost: { color: '#444', fontSize: 14, paddingVertical: 8 },
 
   /* Parça tepsisi */
-  tray: {
-    width: '100%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 4,
-    paddingVertical: 8,
-  },
-  trayPieces: {
-    flex: 1,
-    flexDirection: 'row',
-    justifyContent: 'space-evenly',
-    alignItems: 'center',
-    paddingHorizontal: 4,
-  },
-  traySlot: {
-    position: 'relative',
-  },
+tray: {
+  width: '100%',
+  flexDirection: 'row',
+  alignItems: 'flex-end',
+  justifyContent: 'space-between',
+  paddingHorizontal: 6,
+  paddingVertical: 8,
+  gap: 8,
+},
+trayPieces: {
+  flex: 1,
+  flexDirection: 'row',
+  justifyContent: 'space-between',
+  alignItems: 'flex-end',
+  paddingHorizontal: 8,
+  gap: 10,
+},
+traySlot: {
+  position: 'relative',
+  minHeight: 72,
+  justifyContent: 'center',
+  alignItems: 'center',
+},
   traySlotSelected: {
     // Seçili parça: hafif parlak çerçeve efekti
     borderRadius: 6,

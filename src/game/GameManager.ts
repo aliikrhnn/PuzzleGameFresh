@@ -9,7 +9,6 @@ import {
   clearFullLines,
   calculateScore,
   shouldLevelUp,
-  rotatePiece,
   hasAnyValidPlacement,
 } from './GameLogic';
 import { HighScoreStorage } from './HighScoreStorage';
@@ -234,17 +233,6 @@ export const GameManager = {
     notify();
   },
 
-  rotateCurrent(): boolean {
-    const { piecePool, selectedPieceIndex, gameStatus } = state;
-    if (gameStatus !== 'playing') return false;
-    const piece = piecePool[selectedPieceIndex];
-    if (!piece) return false;
-    const newPool = [...piecePool];
-    newPool[selectedPieceIndex] = rotatePiece(piece);
-    state.piecePool = newPool;
-    notify();
-    return true;
-  },
 
   selectPiece(index: number) {
     if (state.gameStatus !== 'playing') return;

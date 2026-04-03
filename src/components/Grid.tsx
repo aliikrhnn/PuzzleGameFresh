@@ -53,56 +53,64 @@ export function Grid({
     for (const [key] of Object.entries(fallDistances)) {
       const [r, c] = key.split('-').map(Number);
       anims.push(
-        Animated.timing(fallAnims[r * BOARD_COLS + c], {
-          toValue: 0,
-          duration: 220,
-          easing: Easing.out(Easing.quad),
-          useNativeDriver: true,
-        }),
+Animated.timing(fallAnims[r * BOARD_COLS + c], {
+  toValue: 0,
+  duration: 260,
+  easing: Easing.linear,
+  useNativeDriver: true,
+}),
       );
     }
     Animated.parallel(anims).start();
   }, [fallDistances]);
 
   // ── Aktif parça smooth düşüş ───────────────────────────────────────────────
-  const animY = useRef(new Animated.Value(0)).current;
-  const animX = useRef(new Animated.Value(0)).current;
-  const prevPieceId = useRef<string | undefined>(undefined);
-  const prevRow = useRef(0);
+ const animY = useRef(new Animated.Value(0)).current;
+const animX = useRef(new Animated.Value(0)).current;
+const prevPieceId = useRef<string | undefined>(undefined);
 
-  const fpRow = fallingPiece?.row ?? -1;
-  const fpCol = fallingPiece?.col ?? -1;
-  const fpId  = fallingPiece?.piece.id ?? '';
+const fpRow = fallingPiece?.row ?? -1;
+const fpCol = fallingPiece?.col ?? -1;
+const fpId = fallingPiece?.piece.id ?? '';
 
-  useEffect(() => {
-    if (fpRow < 0 || !fpId) return;
-    const targetY = fpRow * step;
-    const targetX = fpCol * step;
+useEffect(() => {
+  if (fpRow < 0 || !fpId) return;
 
-    if (fpId !== prevPieceId.current) {
-      // Yeni parça: anında konumlan
-      animY.setValue(targetY);
-      animX.setValue(targetX);
-    } else if (fpRow === prevRow.current + 1) {
-      // Otomatik 1-satır düşüş: her seferinde logik başlangıç noktasından animate et
-      animY.setValue((fpRow - 1) * step);
+  const targetY = fpRow * step;
+  const targetX = fpCol * step;
+
+  if (fpId !== prevPieceId.current) {
+    // Yeni parça spawn olduğunda snap et, sonra sonraki hareketler akan animasyonla gelsin
+    animY.stopAnimation();
+    animX.stopAnimation();
+    animY.setValue(targetY);
+    animX.setValue(targetX);
+    prevPieceId.current = fpId;
+    return;
+  }
+
+  animY.stopAnimation((currentY) => {
+    const distance = Math.abs(targetY - currentY);
+    const rowsMoved = Math.max(1, Math.round(distance / step));
+
+    Animated.parallel([
       Animated.timing(animY, {
         toValue: targetY,
-        duration: 110,
-        easing: Easing.out(Easing.cubic),
+        duration: rowsMoved * 150,
+        easing: Easing.linear,
         useNativeDriver: true,
-      }).start();
-      animX.setValue(targetX);
-    } else {
-      // Hard drop / rotation kick / manuel: anında
-      animY.setValue(targetY);
-      animX.setValue(targetX);
-    }
+      }),
+      Animated.timing(animX, {
+        toValue: targetX,
+        duration: 90,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: true,
+      }),
+    ]).start();
+  });
 
-    prevPieceId.current = fpId;
-    prevRow.current = fpRow;
-  }, [fpRow, fpCol, fpId]);
-
+  prevPieceId.current = fpId;
+}, [fpRow, fpCol, fpId, step]);
   // ── Engel bloğu smooth düşüş ───────────────────────────────────────────────
   const obstacleAnimY = useRef(new Animated.Value(0)).current;
   const prevObstacleRow = useRef(-1);
@@ -123,12 +131,12 @@ export function Grid({
     } else if (obsRow === prevObstacleRow.current + 1) {
       // 1 satır düşüş: animate
       obstacleAnimY.setValue((obsRow - 1) * step);
-      Animated.timing(obstacleAnimY, {
-        toValue: targetY,
-        duration: 180,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: true,
-      }).start();
+Animated.timing(obstacleAnimY, {
+  toValue: targetY,
+  duration: 210,
+  easing: Easing.linear,
+  useNativeDriver: true,
+}).start();
     } else {
       obstacleAnimY.setValue(targetY);
     }
@@ -193,9 +201,9 @@ export function Grid({
                 width: cellSize,
                 height: cellSize,
                 borderRadius: 4,
-                backgroundColor: isValid ? 'rgba(74,222,128,0.22)' : 'rgba(248,113,113,0.22)',
-                borderWidth: 1.5,
-                borderColor: isValid ? '#4ade80' : '#f87171',
+            backgroundColor: isValid ? 'rgba(74,222,128,0.30)' : 'rgba(248,113,113,0.30)',
+            borderWidth: 2,
+            borderColor: isValid ? '#4ade80' : '#f87171',
               }}
             />
           );
