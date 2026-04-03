@@ -16,17 +16,23 @@ export type Cell = {
 
 export type Board = Cell[][];
 
+export type FallingObstacle = {
+  col: number;
+  row: number;
+  color: string;
+};
+
 export type GameState = {
   gameStatus: GameStatus;
   score: number;
   level: number;
   combo: number;
-  currentPiece: Piece | null;
-  currentPosition: { row: number; col: number } | null;
-  nextPiece: Piece | null;
+  piecePool: Piece[];         // her zaman 3 parça
+  selectedPieceIndex: number; // 0 | 1 | 2 — aktif/sürüklenen slot
   board: Board;
   lastClear: { clearedRows: number[]; clearedCols: number[]; fallDistances: Record<string, number> } | null;
   elapsedSeconds: number;
+  fallingObstacle: FallingObstacle | null;
 };
 
 export const BOARD_ROWS = 10;

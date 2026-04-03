@@ -1,33 +1,67 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Animated,
+  PanResponder,
   View,
   Text,
   TouchableOpacity,
   StyleSheet,
   SafeAreaView,
+  useWindowDimensions,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { GameManager } from '../game/GameManager';
 import type { GameState } from '../game/GameState';
+import { BOARD_COLS, BOARD_ROWS } from '../game/GameState';
+import { canPlace } from '../game/GameLogic';
 import { Grid } from '../components/Grid';
-import { PiecePreviewRows } from '../components/PiecePreview';
 import { useAnimations } from '../hooks/useAnimations';
+import { TutorialOverlay, TUTORIAL_KEY } from './TutorialScreen';
+import { Haptics } from '../utils/haptics';
 import type { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Game'>;
+
+const GAP = 3;
 
 export function GameScreen({ navigation }: Props) {
   const [gs, setGs] = useState<GameState>(GameManager.getState());
   const [clearedRows, setClearedRows] = useState<number[]>([]);
   const [clearedCols, setClearedCols] = useState<number[]>([]);
+  const [showTutorial, setShowTutorial] = useState(false);
   const prevStatus = useRef(gs.gameStatus);
-  const prevPieceId = useRef(gs.currentPiece?.id);
 
+  // ── Drag state ──────────────────────────────────────────────────────────────
+  const [activeDragIndex, setActiveDragIndex] = useState<number | null>(null);
+  const activeDragIndexRef = useRef<number | null>(null);
+
+  const [previewPos, setPreviewPos] = useState<{
+    row: number; col: number; isValid: boolean;
+  } | null>(null);
+  const previewPosRef = useRef<{ row: number; col: number; isValid: boolean } | null>(null);
+  const gridMeasures = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+  const gridContainerRef = useRef<View>(null);
+
+  // gs için stable ref (PanResponder closure'larında stale olmasın)
+  const gsRef = useRef(gs);
+  useEffect(() => { gsRef.current = gs; }, [gs]);
+
+  // cellSize — Grid ile aynı formül
+  const { width: screenWidth } = useWindowDimensions();
+  const PADDING = 32;
+  const cellSize = Math.floor((screenWidth - PADDING - GAP * (BOARD_COLS - 1)) / BOARD_COLS);
+  const step = cellSize + GAP;
+  const stepRef = useRef(step);
+  useEffect(() => { stepRef.current = step; }, [step]);
+
+  // ── Animasyonlar ────────────────────────────────────────────────────────────
   const {
     placeFeedback,
     clearFlash,
+    clearGlow,
     gameOverShake,
+    obstacleImpact,
     comboScale,
     comboShake,
     comboBadgeOpacity,
@@ -35,99 +69,209 @@ export function GameScreen({ navigation }: Props) {
     dangerPulse,
     animatePlace,
     animateClear,
+    animateObstacleLand,
     animateGameOver,
     startDanger,
     stopDanger,
   } = useAnimations();
 
-  // GameManager'a abone ol
+  // Drag animasyonu (seçili parça parmağı takip eder)
+  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+
+  // ── Grid ölçümü ─────────────────────────────────────────────────────────────
+  const measureGrid = useCallback(() => {
+    setTimeout(() => {
+      gridContainerRef.current?.measureInWindow((x, y, w, h) => {
+        gridMeasures.current = { x, y, width: w, height: h };
+      });
+    }, 150);
+  }, []);
+
+  // ── PanResponder fabrikası (slot başına bir tane, bir kez oluşturulur) ──────
+  const panResponders = useRef(
+    [0, 1, 2].map(slotIndex =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () =>
+          gsRef.current.gameStatus === 'playing' &&
+          !!gsRef.current.piecePool[slotIndex],
+        onMoveShouldSetPanResponder: () =>
+          gsRef.current.gameStatus === 'playing' &&
+          !!gsRef.current.piecePool[slotIndex],
+
+        onPanResponderGrant: () => {
+          pan.setValue({ x: 0, y: 0 });
+          activeDragIndexRef.current = slotIndex;
+          setActiveDragIndex(slotIndex);
+          GameManager.selectPiece(slotIndex);
+          Haptics.pickup();
+        },
+
+        onPanResponderMove: (_, gestureState) => {
+          pan.setValue({ x: gestureState.dx, y: gestureState.dy });
+
+          const grid = gridMeasures.current;
+          const piece = gsRef.current.piecePool[slotIndex];
+          if (!grid || !piece) return;
+
+          const s = stepRef.current;
+          const pCols = piece.shape[0].length;
+          const pRows = piece.shape.length;
+          // boardWrap borderWidth (1px) hücre başlangıcını kaydırır
+          const relX = gestureState.moveX - grid.x - 1;
+          const relY = gestureState.moveY - grid.y - 1;
+
+          // Parçanın görsel merkezini parmağa hizala.
+          // Gerçek görsel genişlik = pCols*step - GAP (son sütunun sağında gap yok)
+          const rawCol = Math.floor((relX - (pCols * s - GAP) / 2) / s);
+          const rawRow = Math.floor((relY - (pRows * s - GAP) / 2) / s);
+
+          const inGrid =
+            relX > -pCols * s && relX < grid.width + pCols * s &&
+            relY > -pRows * s && relY < grid.height + pRows * s;
+
+          if (!inGrid) {
+            if (previewPosRef.current) { previewPosRef.current = null; setPreviewPos(null); }
+            return;
+          }
+
+          const col = Math.max(0, Math.min(BOARD_COLS - pCols, rawCol));
+          const row = Math.max(0, Math.min(BOARD_ROWS - pRows, rawRow));
+
+          const prev = previewPosRef.current;
+          if (!prev || prev.row !== row || prev.col !== col) {
+            const isValid = canPlace(gsRef.current.board, piece, row, col);
+            const next = { row, col, isValid };
+            previewPosRef.current = next;
+            setPreviewPos(next);
+          }
+        },
+
+        onPanResponderRelease: () => {
+          const prev = previewPosRef.current;
+          previewPosRef.current = null;
+          setPreviewPos(null);
+          activeDragIndexRef.current = null;
+          setActiveDragIndex(null);
+
+          if (prev?.isValid) {
+            const placed = GameManager.placeAt(prev.row, prev.col);
+            if (placed) {
+              pan.setValue({ x: 0, y: 0 });
+              animatePlace();
+              return;
+            }
+          }
+          // Geçersiz: negatif feedback + yay ile geri dön
+          Haptics.invalid();
+          Animated.spring(pan, {
+            toValue: { x: 0, y: 0 },
+            useNativeDriver: false,
+            tension: 150,
+            friction: 8,
+          }).start();
+        },
+
+        onPanResponderTerminate: () => {
+          previewPosRef.current = null;
+          setPreviewPos(null);
+          activeDragIndexRef.current = null;
+          setActiveDragIndex(null);
+          Animated.spring(pan, {
+            toValue: { x: 0, y: 0 },
+            useNativeDriver: false,
+          }).start();
+        },
+      }),
+    ),
+  ).current;
+
+  // ── İlk açılış tutorial kontrolü ────────────────────────────────────────────
+  useEffect(() => {
+    AsyncStorage.getItem(TUTORIAL_KEY)
+      .then(seen => { if (!seen) setShowTutorial(true); })
+      .catch(() => {});
+  }, []);
+
+  // ── Subscriber ──────────────────────────────────────────────────────────────
   useEffect(() => GameManager.subscribe(setGs), []);
 
-  // Ekran unmount olunca zamanlayıcıyı durdur
   useEffect(() => {
     return () => {
       const s = GameManager.getState();
-      if (s.gameStatus === 'playing' || s.gameStatus === 'paused') {
-        GameManager.end();
-      }
+      if (s.gameStatus === 'playing' || s.gameStatus === 'paused') GameManager.end();
     };
   }, []);
 
   // Game over animasyonu
   useEffect(() => {
-    if (gs.gameStatus === 'gameover' && prevStatus.current !== 'gameover') {
-      animateGameOver();
-    }
+    if (gs.gameStatus === 'gameover' && prevStatus.current !== 'gameover') animateGameOver();
     prevStatus.current = gs.gameStatus;
   }, [gs.gameStatus]);
 
-  // Parça kilitlenince (yeni parça spawn) — place animasyonu
-  useEffect(() => {
-    if (gs.currentPiece?.id && gs.currentPiece.id !== prevPieceId.current) {
-      prevPieceId.current = gs.currentPiece.id;
-      if (gs.gameStatus === 'playing') animatePlace();
-    }
-  }, [gs.currentPiece?.id]);
-
-  // Satır/sütun temizlenince flash animasyonu
+  // Clear sonrası flash + falling
   useEffect(() => {
     if (!gs.lastClear) return;
     const { clearedRows: rows, clearedCols: cols } = gs.lastClear;
     setClearedRows(rows);
     setClearedCols(cols);
     animateClear(gs.combo);
-    const t = setTimeout(() => {
-      setClearedRows([]);
-      setClearedCols([]);
-    }, 300);
+    const t = setTimeout(() => { setClearedRows([]); setClearedCols([]); }, 300);
     return () => clearTimeout(t);
   }, [gs.lastClear]);
 
-  // Üst 3 satırda dolu hücre varsa tehlike
-  const isDanger = gs.board.slice(0, 3).some(row => row.some(cell => cell.filled));
+  // Obstacle landing tespiti: fallingObstacle non-null → null geçişi
+  const prevObstacleRef = useRef(gs.fallingObstacle);
+  useEffect(() => {
+    const wasActive = prevObstacleRef.current !== null;
+    prevObstacleRef.current = gs.fallingObstacle;
+    if (wasActive && gs.fallingObstacle === null && gs.gameStatus === 'playing') {
+      animateObstacleLand();
+    }
+  }, [gs.fallingObstacle]);
 
+  // Tehlike (üst 3 satır dolu)
+  const isDanger = gs.board.slice(0, 3).some(row => row.some(cell => cell.filled));
   useEffect(() => {
     if (isDanger && gs.gameStatus === 'playing') startDanger();
     else stopDanger();
   }, [isDanger, gs.gameStatus]);
 
+  // ── Computed ────────────────────────────────────────────────────────────────
   const isGameOver = gs.gameStatus === 'gameover';
   const isPaused = gs.gameStatus === 'paused';
 
-  const fallingPiece =
-    gs.currentPiece && gs.currentPosition
-      ? { piece: gs.currentPiece, row: gs.currentPosition.row, col: gs.currentPosition.col }
-      : undefined;
+  // Sürüklenen parça grid'e ghost önizleme için
+  const activePiece = activeDragIndex !== null ? gs.piecePool[activeDragIndex] : null;
+  const dragPreview = previewPos && activePiece
+    ? { piece: activePiece, ...previewPos }
+    : undefined;
 
   return (
     <SafeAreaView style={styles.safe}>
+      {showTutorial && <TutorialOverlay onDone={() => setShowTutorial(false)} />}
       <View style={styles.container}>
 
         {/* ── Üst bar ── */}
         <View style={styles.topBar}>
-          <View style={styles.statsGroup}>
-            <StatCard label="SKOR" value={gs.score} accent />
-            <View style={styles.statRow}>
-              <StatCard label="SEVİYE" value={gs.level} />
-              <StatCard label="COMBO" value={gs.combo} hot={gs.combo >= 3} />
-            </View>
-            <View style={styles.statRow}>
-              <StatCard label="SÜRE" value={gs.elapsedSeconds} formatter={formatTime} />
-            </View>
-          </View>
-          <View style={styles.nextBox}>
-            <Text style={styles.nextLabel}>SIRADAKI</Text>
-            {gs.nextPiece && <PiecePreviewRows piece={gs.nextPiece} label="" />}
-          </View>
+          <StatCard label="SKOR" value={gs.score} accent />
+          <StatCard label="SEVİYE" value={gs.level} />
+          <StatCard label="COMBO" value={gs.combo} hot={gs.combo >= 3} />
+          <StatCard label="SÜRE" value={gs.elapsedSeconds} formatter={formatTime} />
         </View>
 
         {/* ── Board ── */}
-        <View style={styles.boardWrap}>
+        <View
+          ref={gridContainerRef}
+          style={styles.boardWrap}
+          onLayout={measureGrid}
+        >
           <Animated.View
             style={{
               transform: [
                 { translateX: gameOverShake },
                 { translateX: comboShake },
+                { translateY: obstacleImpact },
+                { scale: placeFeedback },
                 { scale: comboScale },
               ],
             }}
@@ -137,18 +281,25 @@ export function GameScreen({ navigation }: Props) {
               clearedRows={clearedRows}
               clearedCols={clearedCols}
               clearFlash={clearFlash}
-              fallingPiece={isGameOver ? undefined : fallingPiece}
               fallDistances={gs.lastClear?.fallDistances}
+              dragPreview={dragPreview}
+              fallingObstacle={gs.fallingObstacle}
             />
           </Animated.View>
 
-          {/* Danger overlay — board dolmaya yaklaşınca kırmızı nabız */}
+          {/* Clear glow — board-level purple flash */}
+          <Animated.View
+            pointerEvents="none"
+            style={[styles.clearGlowOverlay, { opacity: clearGlow }]}
+          />
+
+          {/* Danger overlay */}
           <Animated.View
             pointerEvents="none"
             style={[styles.dangerOverlay, { opacity: dangerPulse }]}
           />
 
-          {/* Combo badge — opacity ile kontrol edilir, her zaman mount */}
+          {/* Combo badge */}
           <Animated.View
             pointerEvents="none"
             style={[
@@ -157,13 +308,8 @@ export function GameScreen({ navigation }: Props) {
             ]}
           >
             <View style={[styles.comboBadgePill, gs.combo >= 3 && styles.comboBadgePillHot]}>
-              <Text
-                style={[
-                  styles.comboBadgeText,
-                  gs.combo >= 3 && styles.comboBadgeTextHot,
-                ]}
-              >
-                ×{gs.combo} COMBO
+              <Text style={[styles.comboBadgeText, gs.combo >= 3 && styles.comboBadgeTextHot]}>
+                {gs.combo <= 1 ? 'CLEARED' : `×${gs.combo} COMBO`}
               </Text>
             </View>
           </Animated.View>
@@ -189,62 +335,91 @@ export function GameScreen({ navigation }: Props) {
           {isPaused && (
             <View style={styles.overlay}>
               <Text style={styles.pauseTitle}>DURAKLADI</Text>
-              <TouchableOpacity
-                style={styles.btnPrimary}
-                onPress={() => GameManager.togglePause()}
-              >
+              <TouchableOpacity style={styles.btnPrimary} onPress={() => GameManager.togglePause()}>
                 <Text style={styles.btnPrimaryText}>Devam Et</Text>
               </TouchableOpacity>
             </View>
           )}
         </View>
 
-        {/* ── Kontroller ── */}
+        {/* ── Parça Tepsisi ── */}
         {!isGameOver && (
-          <View style={styles.controls}>
-            {/* Yön + döndür */}
-            <View style={styles.ctrlRow}>
-              <TouchableOpacity style={styles.ctrlBtn} onPress={() => GameManager.moveLeft()}>
-                <Text style={styles.ctrlText}>◀</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.ctrlBtn}
-                onPress={() => GameManager.rotateCurrent()}
-              >
-                <Text style={styles.ctrlText}>↻</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.ctrlBtn} onPress={() => GameManager.moveRight()}>
-                <Text style={styles.ctrlText}>▶</Text>
-              </TouchableOpacity>
-            </View>
+          <View style={styles.tray}>
 
-            {/* Hard drop */}
-            <View style={styles.ctrlRow}>
-              <Animated.View style={{ transform: [{ scale: placeFeedback }] }}>
-                <TouchableOpacity
-                  style={[styles.ctrlBtn, styles.ctrlBtnWide]}
-                  onPress={() => GameManager.hardDrop()}
-                >
-                  <Text style={styles.ctrlText}>⬇⬇ BIRAK</Text>
-                </TouchableOpacity>
-              </Animated.View>
+            {/* Döndür (seçili parçayı) */}
+            <TouchableOpacity style={styles.trayBtn} onPress={() => GameManager.rotateCurrent()}>
+              <Text style={styles.trayBtnText}>↻</Text>
+            </TouchableOpacity>
+
+            {/* 3 sürüklenebilir parça */}
+            <View style={styles.trayPieces}>
+              {gs.piecePool.map((piece, slotIndex) => {
+                const isDraggingThis = activeDragIndex === slotIndex;
+                const isSelected = gs.selectedPieceIndex === slotIndex;
+                const pCols = piece.shape[0].length;
+                const pRows = piece.shape.length;
+                const pW = pCols * step - GAP;
+                const pH = pRows * step - GAP;
+
+                return (
+                  <Animated.View
+                    key={piece.id}
+                    {...panResponders[slotIndex].panHandlers}
+                    style={[
+                      styles.traySlot,
+                      isSelected && !isDraggingThis && styles.traySlotSelected,
+                      {
+                        width: pW,
+                        height: pH,
+                        opacity: activeDragIndex !== null && !isDraggingThis ? 0.45 : 1,
+                        transform: isDraggingThis
+                          ? [{ translateX: pan.x }, { translateY: pan.y }]
+                          : [],
+                      },
+                    ]}
+                  >
+                    {piece.shape.map((row, r) =>
+                      row.map((cell, c) => {
+                        if (!cell) return null;
+                        return (
+                          <View
+                            key={`${r}-${c}`}
+                            style={{
+                              position: 'absolute',
+                              top: r * step,
+                              left: c * step,
+                              width: cellSize,
+                              height: cellSize,
+                              backgroundColor: piece.color,
+                              borderRadius: 4,
+                              shadowColor: piece.color,
+                              shadowOffset: { width: 0, height: 0 },
+                              shadowOpacity: isDraggingThis ? 0.75 : isSelected ? 0.55 : 0.3,
+                              shadowRadius: isDraggingThis ? 8 : 4,
+                              elevation: isDraggingThis ? 10 : isSelected ? 6 : 3,
+                            }}
+                          />
+                        );
+                      })
+                    )}
+                  </Animated.View>
+                );
+              })}
             </View>
 
             {/* Duraklat / Bitir */}
-            <View style={styles.ctrlRow}>
-              <TouchableOpacity
-                style={styles.btnEnd}
-                onPress={() => GameManager.togglePause()}
-              >
-                <Text style={styles.btnEndText}>{isPaused ? 'Devam' : 'Duraklat'}</Text>
+            <View style={styles.trayActions}>
+              <TouchableOpacity style={styles.trayBtn} onPress={() => GameManager.togglePause()}>
+                <Text style={styles.trayBtnText}>{isPaused ? '▶' : '⏸'}</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.btnEnd, styles.btnEndDanger]}
+                style={[styles.trayBtn, styles.trayBtnDanger]}
                 onPress={() => GameManager.end()}
               >
-                <Text style={styles.btnEndText}>Bitir</Text>
+                <Text style={[styles.trayBtnText, { color: '#ef4444' }]}>✕</Text>
               </TouchableOpacity>
             </View>
+
           </View>
         )}
 
@@ -276,11 +451,7 @@ function StatCard({
     <View style={[styles.statCard, accent && styles.statCardAccent, hot && styles.statCardHot]}>
       <Text style={styles.statLabel}>{label}</Text>
       <Text
-        style={[
-          styles.statValue,
-          accent && styles.statValueAccent,
-          hot && styles.statValueHot,
-        ]}
+        style={[styles.statValue, accent && styles.statValueAccent, hot && styles.statValueHot]}
         numberOfLines={1}
         adjustsFontSizeToFit
       >
@@ -291,67 +462,52 @@ function StatCard({
 }
 
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: '#0a0a14',
-  },
+  safe: { flex: 1, backgroundColor: '#0a0a14' },
   container: {
     flex: 1,
     alignItems: 'center',
     paddingHorizontal: 16,
     paddingTop: 8,
-    paddingBottom: 16,
+    paddingBottom: 12,
     gap: 10,
   },
 
-  /* Üst bar */
+  /* Üst bar — yatay sıra */
   topBar: {
     width: '100%',
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
+    gap: 6,
   },
-  statsGroup: { gap: 6, flex: 1, marginRight: 12 },
-  statRow: { flexDirection: 'row', gap: 6 },
   statCard: {
+    flex: 1,
     backgroundColor: '#13131f',
     borderRadius: 8,
     paddingVertical: 6,
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     borderWidth: 1,
     borderColor: '#1e1e2e',
-    maxWidth: 120,
-    minWidth: 56,
+    alignItems: 'center',
   },
   statCardAccent: { borderColor: '#4c1d95', backgroundColor: '#12052e' },
   statCardHot: { borderColor: '#92400e', backgroundColor: '#1c0a00' },
   statLabel: { color: '#555', fontSize: 9, fontWeight: '700', letterSpacing: 1 },
-  statValue: { color: '#c4b5fd', fontSize: 18, fontWeight: '700', marginTop: 1 },
-  statValueAccent: { color: '#a78bfa', fontSize: 24 },
+  statValue: { color: '#c4b5fd', fontSize: 16, fontWeight: '700', marginTop: 1 },
+  statValueAccent: { color: '#a78bfa', fontSize: 20 },
   statValueHot: { color: '#fb923c' },
 
-  /* Next piece */
-  nextBox: {
-    backgroundColor: '#13131f',
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#1e1e2e',
-    padding: 8,
-    alignItems: 'center',
-    minWidth: 80,
-    gap: 4,
-  },
-  nextLabel: { color: '#555', fontSize: 9, fontWeight: '700', letterSpacing: 1 },
-
   /* Board */
-  boardWrap: {
+  boardWrap: { borderRadius: 10, overflow: 'hidden', borderWidth: 1, borderColor: '#1e1e2e' },
+
+  /* Clear glow */
+  clearGlowOverlay: {
+    ...StyleSheet.absoluteFillObject,
     borderRadius: 10,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#1e1e2e',
+    backgroundColor: '#a855f7', // purple-500
   },
 
-  /* Danger overlay */
+  /* Danger */
   dangerOverlay: {
     ...StyleSheet.absoluteFillObject,
     borderWidth: 3,
@@ -361,11 +517,7 @@ const styles = StyleSheet.create({
   },
 
   /* Combo badge */
-  comboBadge: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  comboBadge: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center' },
   comboBadgePill: {
     backgroundColor: 'rgba(12,4,30,0.90)',
     borderRadius: 22,
@@ -374,10 +526,7 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: '#7c3aed',
   },
-  comboBadgePillHot: {
-    borderColor: '#f59e0b',
-    backgroundColor: 'rgba(30,10,0,0.90)',
-  },
+  comboBadgePillHot: { borderColor: '#f59e0b', backgroundColor: 'rgba(30,10,0,0.90)' },
   comboBadgeText: {
     color: '#c4b5fd',
     fontSize: 28,
@@ -387,10 +536,7 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 0 },
     textShadowRadius: 16,
   },
-  comboBadgeTextHot: {
-    color: '#fbbf24',
-    textShadowColor: '#f59e0b',
-  },
+  comboBadgeTextHot: { color: '#fbbf24', textShadowColor: '#f59e0b' },
 
   /* Overlays */
   overlay: {
@@ -401,27 +547,10 @@ const styles = StyleSheet.create({
     gap: 10,
     padding: 24,
   },
-  overlayTitle: {
-    color: '#f87171',
-    fontSize: 28,
-    fontWeight: '800',
-    letterSpacing: 3,
-  },
-  pauseTitle: {
-    color: '#a78bfa',
-    fontSize: 24,
-    fontWeight: '800',
-    letterSpacing: 2,
-  },
-  overlayScore: {
-    color: '#f0f0f0',
-    fontSize: 40,
-    fontWeight: '700',
-    lineHeight: 44,
-  },
+  overlayTitle: { color: '#f87171', fontSize: 28, fontWeight: '800', letterSpacing: 3 },
+  pauseTitle: { color: '#a78bfa', fontSize: 24, fontWeight: '800', letterSpacing: 2 },
+  overlayScore: { color: '#f0f0f0', fontSize: 40, fontWeight: '700', lineHeight: 44 },
   overlayHigh: { color: '#555', fontSize: 13, marginBottom: 12 },
-
-  /* Butonlar */
   btnPrimary: {
     backgroundColor: '#7c3aed',
     borderRadius: 10,
@@ -433,28 +562,45 @@ const styles = StyleSheet.create({
   btnPrimaryText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   btnGhost: { color: '#444', fontSize: 14, paddingVertical: 8 },
 
-  /* Kontroller */
-  controls: { width: '100%', gap: 8 },
-  ctrlRow: { flexDirection: 'row', justifyContent: 'center', gap: 12 },
-  ctrlBtn: {
+  /* Parça tepsisi */
+  tray: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 4,
+    paddingVertical: 8,
+  },
+  trayPieces: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  traySlot: {
+    position: 'relative',
+  },
+  traySlotSelected: {
+    // Seçili parça: hafif parlak çerçeve efekti
+    borderRadius: 6,
+    shadowColor: '#a78bfa',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  trayBtn: {
     backgroundColor: '#13131f',
     borderWidth: 1,
     borderColor: '#2a1a4e',
     borderRadius: 10,
-    width: 68,
-    height: 54,
+    width: 52,
+    height: 52,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  ctrlBtnWide: { width: 160 },
-  ctrlText: { color: '#a78bfa', fontSize: 20, fontWeight: '700' },
-  btnEnd: {
-    borderWidth: 1,
-    borderColor: '#2a1a4e',
-    borderRadius: 8,
-    paddingVertical: 10,
-    paddingHorizontal: 32,
-  },
-  btnEndDanger: { borderColor: '#4a1a1a' },
-  btnEndText: { color: '#6d28d9', fontSize: 14, fontWeight: '600' },
+  trayBtnDanger: { borderColor: '#4a1a1a' },
+  trayBtnText: { color: '#a78bfa', fontSize: 22, fontWeight: '700' },
+  trayActions: { gap: 8, alignItems: 'center' },
 });
